@@ -13,10 +13,15 @@ Girdi: tagged_events_example.json (veya aynı şemadaki JSONL/JSON dosyası)
 Çıktı: processed/ ve vocab/ klasörlerine JSON artifact'lar
 """
 
+import gc
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -461,8 +466,13 @@ class DataPreprocessor:
         self._bert_model.eval()
 
         import torch
-        # CUDA varsa GPU'ya taşı; yoksa CPU'da çalışmaya devam et
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        # CUDA → Apple MPS → CPU sırasıyla en hızlı backend'i seç
+        if torch.cuda.is_available():
+            self._device = "cuda"
+        elif torch.backends.mps.is_available():
+            self._device = "mps"
+        else:
+            self._device = "cpu"
         self._bert_model.to(self._device)
 
     def extract_message_embeddings_offline(
@@ -647,21 +657,24 @@ class DataPreprocessor:
 
     def save_artifacts(self, output_dir: str) -> Dict[str, str]:
         """
-        fit_transform() sonuçlarını yapılandırılmış klasörlere yazar:
+        Pipeline'ı adım adım çalıştırır ve her artifact'ı üretildikten hemen
+        sonra diske yazar. Her aşama bittiğinde büyük ara veriler bellekten
+        atılır — düşük RAM'li makinelerde (örn. 8 GB Mac) OOM'u önler.
 
+        Çıktı dosyaları:
           output_dir/
             vocab/
-              all_vocabs.json          → tüm kategorik sözlükler
-              tag_vocab.json           → tag listesi
+              all_vocabs.json
+              tag_vocab.json
             processed/
-              session_features.json   → oturum düzey sayısal özellikler
-              event_sequences.json    → padding'li integer diziler (her alan)
-              tag_sequences.json      → padding'li multi-hot matrisler
-              message_embedding_sequences.json  → padding'li BERT vektörler
-              metadata.json           → boyutlar, model adı, parametreler
+              session_features.json
+              event_sequences.json
+              tag_sequences.json
+              message_embedding_sequences.json
+              labels.json (time_shift=True ise)
+              metadata.json
         """
-        artifacts = self.fit_transform()
-        out       = Path(output_dir)
+        out = Path(output_dir)
         (out / "vocab").mkdir(parents=True, exist_ok=True)
         (out / "processed").mkdir(parents=True, exist_ok=True)
 
@@ -678,33 +691,101 @@ class DataPreprocessor:
             "metadata":                     out / "processed" / "metadata.json",
         }
 
-        _dump(paths["all_vocabs"],                  artifacts["vocabs"])
-        _dump(paths["tag_vocab"],                   artifacts["tag_vocab"])
-        _dump(paths["session_features"],            artifacts["sessionFeatures"])
-        _dump(paths["event_sequences"],             artifacts["eventSequences"])
-        _dump(paths["tag_sequences"],               artifacts["tagSequences"])
-        _dump(paths["message_embedding_sequences"], artifacts["messageEmbeddingSequences"])
-        if "labels" in artifacts:
+        # 0) Veri yükle ve vocabs'ı çıkar (küçük yapılar, bellekte tut)
+        if not self.raw_sessions:
+            self.load_data()
+        if not self.vocabs:
+            self.build_categorical_vocabs()
+        self.build_tag_vocab()
+
+        _dump(paths["all_vocabs"], self.vocabs)
+        _dump(paths["tag_vocab"],  self.tag_vocab)
+        _LOGGER.info("Vocab dosyalari yazildi.")
+
+        # 1) Time shift (etkin ise) → büyük raw_sessions'ı küçült
+        labels: Optional[List[int]] = None
+        if self.time_shift:
+            sessions_for_x, labels = self._build_time_shifted_samples()
+            if not sessions_for_x:
+                raise ValueError("Time shifting sonrasi gecerli oturum kalmadi.")
+            # Ham veriye artık ihtiyacımız yok — bellekten at
+            self.raw_sessions = []
+            gc.collect()
+        else:
+            sessions_for_x = self.raw_sessions
+
+        num_sessions = len(sessions_for_x)
+        _LOGGER.info("Pipeline'a giren ornek sayisi: %d", num_sessions)
+
+        # 2) Session features → yaz → boşalt
+        session_features = self.extract_session_features(sessions_for_x)
+        session_feature_dim = len(session_features[0]) if session_features else 0
+        _dump(paths["session_features"], session_features)
+        del session_features
+        gc.collect()
+        _LOGGER.info("session_features yazildi.")
+
+        # 3) Kategorik diziler → padding → yaz → boşalt
+        cat_sequences, session_ids, user_ids = self.encode_categorical_sequences(sessions_for_x)
+        padded_cat: Dict[str, List[List[int]]] = {}
+        for field in list(cat_sequences.keys()):
+            padded_cat[field] = self._pad_truncate_int(cat_sequences[field])
+            del cat_sequences[field]
+        del cat_sequences
+        _dump(paths["event_sequences"], padded_cat)
+        del padded_cat
+        gc.collect()
+        _LOGGER.info("event_sequences yazildi.")
+
+        # 4) Tag dizileri → multi-hot padding → yaz → boşalt (en büyük yapı)
+        raw_tag_seqs = self.encode_tag_sequences(sessions_for_x)
+        padded_tag_seqs = self._pad_truncate_multihot(raw_tag_seqs)
+        del raw_tag_seqs
+        gc.collect()
+        _dump(paths["tag_sequences"], padded_tag_seqs)
+        del padded_tag_seqs
+        gc.collect()
+        _LOGGER.info("tag_sequences yazildi.")
+
+        # 5) BERT embedding sıraları → padding → yaz → boşalt
+        raw_emb_seqs = self.build_message_embedding_sequences(sessions_for_x)
+        padded_emb_seqs = self._pad_truncate_embeddings(raw_emb_seqs)
+        del raw_emb_seqs
+        gc.collect()
+        emb_dim = len(padded_emb_seqs[0][0]) if padded_emb_seqs and padded_emb_seqs[0] else 768
+        _dump(paths["message_embedding_sequences"], padded_emb_seqs)
+        del padded_emb_seqs
+        # BERT modelini de bellekten at (sonraki adımlar gerekmiyor)
+        self._bert_model = None
+        self._tokenizer = None
+        gc.collect()
+        _LOGGER.info("message_embedding_sequences yazildi.")
+
+        # 6) Labels (time_shift varsa)
+        label_num_classes = None
+        if labels is not None:
             labels_path = out / "processed" / "labels.json"
             paths["labels"] = labels_path
-            _dump(labels_path, artifacts["labels"])
+            _dump(labels_path, labels)
+            label_num_classes = len(self.vocabs[self.label_field])
+
+        # 7) Metadata
         _dump(paths["metadata"], {
             "maxSessionLength":  self.MAX_SESSION_LENGTH,
-            "numSessions":       artifacts["numSessions"],
+            "numSessions":       num_sessions,
             "truncation":        self.truncation,
             "padding":           self.padding,
-            "timeShifted":        self.time_shift,
-            "timeShiftMode":      self.time_shift_mode,
-            "labelName":          artifacts.get("labelName"),
-            "labelNumClasses":    artifacts.get("labelNumClasses"),
-            "minSessionLength":   self.min_session_length,
+            "timeShifted":       self.time_shift,
+            "timeShiftMode":     self.time_shift_mode,
+            "labelName":         self.label_field if labels is not None else None,
+            "labelNumClasses":   label_num_classes,
+            "minSessionLength":  self.min_session_length,
             "bertModel":         self.bert_model_name,
             "bertPooling":       self.bert_pooling,
-            "tagVocabSize":      len(artifacts["tag_vocab"]),
-            "categoricalVocabs": {k: len(v) for k, v in artifacts["vocabs"].items()},
-            "embeddingDimension": artifacts["embeddingDimension"],
-            "sessionFeatureDim": len(artifacts["sessionFeatures"][0])
-                                 if artifacts["sessionFeatures"] else 0,
+            "tagVocabSize":      len(self.tag_vocab),
+            "categoricalVocabs": {k: len(v) for k, v in self.vocabs.items()},
+            "embeddingDimension": emb_dim,
+            "sessionFeatureDim": session_feature_dim,
         })
 
         return {name: str(path) for name, path in paths.items()}
