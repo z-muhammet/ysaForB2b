@@ -18,6 +18,8 @@ import json
 import logging
 import math
 from pathlib import Path
+
+import numpy as np
 from typing import Dict, List, Literal, Optional, Tuple
 
 
@@ -301,42 +303,47 @@ class DataPreprocessor:
     def encode_categorical_sequences(
         self,
         sessions: Optional[List[dict]] = None,
-    ) -> Tuple[Dict[str, List[List[int]]], List[str], List[str]]:
+    ) -> Tuple[Dict[str, np.ndarray], List[str], List[str]]:
         """
-        Her session için her kategorik alan adına ait ham integer dizi üretir.
-        Padding henüz uygulanmaz — Adım 5'e bırakılır.
-
-        Döner:
-            sequences  : {alan_adı: [[int, …], …]}  (session × event)
-            session_ids: oturum kimlik listesi
-            user_ids   : kullanıcı kimlik listesi
+        Her session icin her kategorik alan adina ait padded integer array uretir.
+        Cikti: {alan_adi: np.ndarray(N, T, int32)}
         """
-        # Sözlükler henüz inşa edilmemişse otomatik olarak çalıştır
         if not self.vocabs:
             self.build_categorical_vocabs()
 
         all_fields = list(self.vocabs.keys())
-        # Her alan için oturum başına integer dizi tutacak boş yapı
-        sequences: Dict[str, List[List[int]]] = {f: [] for f in all_fields}
-        session_ids: List[str] = []
-        user_ids: List[str]    = []
-
         use_sessions = sessions if sessions is not None else self.raw_sessions
+        N = len(use_sessions)
+        T = self.MAX_SESSION_LENGTH
+        session_ids: List[str] = []
+        user_ids: List[str] = []
 
-        for session in use_sessions:
+        # Dogrudan numpy array olustur — Python list overhead yok
+        arrays: Dict[str, np.ndarray] = {
+            f: np.zeros((N, T), dtype=np.int32) for f in all_fields
+        }
+
+        for i, session in enumerate(use_sessions):
             session_ids.append(session.get("sessionId", ""))
             user_ids.append(session.get("userId", ""))
-
+            events = session.get("sequentialEvents", [])
+            # Truncation
+            if len(events) > T:
+                events = events[-T:] if self.truncation == "pre" else events[:T]
+            n = len(events)
             for field in all_fields:
-                seq = []
-                for event in session.get("sequentialEvents", []):
-                    raw_val = event.get(field)
-                    # Alan eksikse PAD tokenına (0) dönüştür; vocab'da bilinmeyen değer de 0'a map edilir
-                    val = str(raw_val) if raw_val is not None else "PAD"
-                    seq.append(self.vocabs[field].get(val, 0))
-                sequences[field].append(seq)
+                vocab = self.vocabs[field]
+                row = np.array(
+                    [vocab.get(str(e.get(field)) if e.get(field) is not None else "PAD", 0)
+                     for e in events],
+                    dtype=np.int32,
+                )
+                if self.padding == "pre":
+                    arrays[field][i, T - n:] = row
+                else:
+                    arrays[field][i, :n] = row
 
-        return sequences, session_ids, user_ids
+        return arrays, session_ids, user_ids
 
     def _build_time_shifted_samples(
         self,
@@ -413,33 +420,41 @@ class DataPreprocessor:
         self.tag2idx   = {tag: idx for idx, tag in enumerate(self.tag_vocab)}
         return self.tag_vocab
 
-    def encode_tag_sequences(self, sessions: Optional[List[dict]] = None) -> List[List[List[int]]]:
+    def encode_and_pad_tags_to_file(
+        self, sessions: Optional[List[dict]], out_path: Path
+    ) -> int:
         """
-        Her session için multi-hot binary tag matrisi üretir (padding öncesi).
-        Kavramsal şekil: num_sessions × event_count × tag_vocab_size
+        Tag dizilerini encode eder, padding uygular ve dogrudan
+        memory-mapped .npy dosyasina yazar. Python list hic olusturulmaz.
+        Cikti: (N, T, tag_vocab_size) uint8 dosyasi.
+        Dondurur: tag_vocab_size.
         """
-        # Vocab henüz oluşturulmamışsa otomatik çalıştır
         if not self.tag_vocab:
             self.build_tag_vocab(sessions)
 
-        tag_size = len(self.tag_vocab)  # multi-hot vektörünün boyutu
-        result: List[List[List[int]]] = []
-
         use_sessions = sessions if sessions is not None else self.raw_sessions
-        for session in use_sessions:
-            session_seq = []
-            for event in session.get("sequentialEvents", []):
-                # Sıfırlarla başla; yalnızca bu event'e ait tag indeksleri 1 yapılır
-                vec = [0] * tag_size
+        N        = len(use_sessions)
+        T        = self.MAX_SESSION_LENGTH
+        tag_size = len(self.tag_vocab)
+
+        mmap = np.lib.format.open_memmap(
+            str(out_path), mode="w+", dtype=np.uint8, shape=(N, T, tag_size)
+        )
+
+        for i, session in enumerate(use_sessions):
+            events = session.get("sequentialEvents", [])
+            if len(events) > T:
+                events = events[-T:] if self.truncation == "pre" else events[:T]
+            n = len(events)
+            offset = T - n if self.padding == "pre" else 0
+            for j, event in enumerate(events):
                 for tag in event.get("tags", []):
                     idx = self.tag2idx.get(tag)
-                    # Veri setinde görülmemiş tag'ler (None) sessizce atlanır
                     if idx is not None:
-                        vec[idx] = 1
-                session_seq.append(vec)
-            result.append(session_seq)
+                        mmap[i, offset + j, idx] = 1
 
-        return result
+        del mmap  # flush & close
+        return tag_size
 
     # -----------------------------------------------------------------------
     # ADIM 4 — Offline BERT embedding (message_normalized)
@@ -453,15 +468,25 @@ class DataPreprocessor:
 
         try:
             import torch
-            from transformers import AutoModel, AutoTokenizer
+            from transformers import AutoModel, AutoTokenizer, logging as hf_logging
         except Exception as exc:
             raise ImportError(
                 "BERT embedding için 'torch' ve 'transformers' gerekli.\n"
                 "pip install torch transformers"
             ) from exc
 
-        self._tokenizer  = AutoTokenizer.from_pretrained(self.bert_model_name)
-        self._bert_model = AutoModel.from_pretrained(self.bert_model_name)
+        _prev_hf_verbosity = hf_logging.get_verbosity()
+        hf_logging.set_verbosity_error()
+        _from_pretrained_kwargs = dict(local_files_only=True)
+        try:
+            self._tokenizer  = AutoTokenizer.from_pretrained(self.bert_model_name, **_from_pretrained_kwargs)
+            self._bert_model = AutoModel.from_pretrained(self.bert_model_name, **_from_pretrained_kwargs)
+        except Exception:
+            # Cache'de yoksa internetten indir, sonraki çalıştırmalar cache'den gelir
+            _from_pretrained_kwargs = {}
+            self._tokenizer  = AutoTokenizer.from_pretrained(self.bert_model_name)
+            self._bert_model = AutoModel.from_pretrained(self.bert_model_name)
+        hf_logging.set_verbosity(_prev_hf_verbosity)
         # eval() modu dropout ve batch norm'u kapatır; inference için gerekli
         self._bert_model.eval()
 
@@ -492,8 +517,7 @@ class DataPreprocessor:
           anlamsal farkı sadece integer ID yakalayamaz; BERT bu farkı
           768 boyutlu vektör uzayında kodlar.
         """
-        # Set comprehension ile tekrarlayan metinleri eledikten sonra sırala
-        # (sıralama, aynı veri setinde tutarlı batch oluşturur)
+        import hashlib
         use_sessions = sessions if sessions is not None else self.raw_sessions
 
         unique_texts = sorted({
@@ -503,20 +527,31 @@ class DataPreprocessor:
             if event.get("message_normalized")
         })
 
-        # Encode edilecek metin yoksa mevcut önbelleği döndür
         if not unique_texts:
+            return self.message_embeddings
+
+        # Disk cache: .npz (numpy binary) — JSON'a göre 5-10x küçük, parse yükü sıfır
+        _cache_key  = hashlib.md5("\n".join(unique_texts).encode()).hexdigest()
+        _cache_path = Path(self.data_path).parent / f".bert_emb_cache_{_cache_key}.npz"
+        if _cache_path.exists():
+            _LOGGER.info("BERT embedding cache bulundu, diskten yukleniyor: %s", _cache_path)
+            _npz = np.load(str(_cache_path), allow_pickle=False)
+            # texts dizisi ve vectors matrisi olarak saklanir
+            _texts   = _npz["texts"].tolist()
+            _vectors = _npz["vectors"]          # (N, emb_dim) float32
+            self.message_embeddings = {t: _vectors[i] for i, t in enumerate(_texts)}
             return self.message_embeddings
 
         self._lazy_load_bert()
         import torch
 
-        embeddings: Dict[str, List[float]] = {}
+        total_batches = (len(unique_texts) + self.bert_batch_size - 1) // self.bert_batch_size
+        # Python list yerine dogrudan numpy array biriktir → Python object overhead yok
+        all_vecs: List[np.ndarray] = []
 
-        # gradient hesaplamasını kapat: bellek tasarrufu + hız
         with torch.no_grad():
-            for i in range(0, len(unique_texts), self.bert_batch_size):
+            for batch_idx, i in enumerate(range(0, len(unique_texts), self.bert_batch_size)):
                 batch  = unique_texts[i : i + self.bert_batch_size]
-                # max_length=64: B2B mesajları genellikle kısa; kırpma bilgi kaybını minimize eder
                 tokens = self._tokenizer(
                     batch,
                     return_tensors="pt",
@@ -524,46 +559,55 @@ class DataPreprocessor:
                     truncation=True,
                     max_length=64,
                 )
-                # Tensörleri seçilen cihaza (CPU/GPU) taşı
                 tokens  = {k: v.to(self._device) for k, v in tokens.items()}
                 outputs = self._bert_model(**tokens)
 
                 if self.bert_pooling == "mean":
-                    # Attention mask ile ağırlıklı ortalama: padding token'larını dışarıda bırakır
                     last = outputs.last_hidden_state
                     mask = tokens["attention_mask"].unsqueeze(-1).expand(last.size()).float()
                     vecs = (last * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
                 else:
-                    # CLS token (indeks 0): cümle düzeyinde özetleme için BERT'in tasarım tercihi
                     vecs = outputs.last_hidden_state[:, 0, :]
 
-                # CPU'ya al ve Python list'e çevir (JSON serileştirilebilir)
-                for text, vec in zip(batch, vecs.detach().cpu().tolist()):
-                    embeddings[text] = vec
+                all_vecs.append(vecs.detach().cpu().to(torch.float32).numpy())
 
-        self.message_embeddings = embeddings
+                if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
+                    _LOGGER.info(
+                        "BERT encoding: %d/%d batch islendi (%d/%d metin)",
+                        batch_idx + 1, total_batches,
+                        min(i + self.bert_batch_size, len(unique_texts)), len(unique_texts),
+                    )
+
+        vectors_arr = np.concatenate(all_vecs, axis=0)  # (N, emb_dim) float32
+        del all_vecs
+
+        # Cache'e yaz: texts string dizisi + vectors float32 matrisi
+        _LOGGER.info("BERT embedding cache diske yaziliyor: %s", _cache_path)
+        np.savez_compressed(
+            str(_cache_path),
+            texts=np.array(unique_texts, dtype=object),
+            vectors=vectors_arr,
+        )
+
+        self.message_embeddings = {t: vectors_arr[i] for i, t in enumerate(unique_texts)}
         return self.message_embeddings
 
     def build_message_embedding_sequences(
         self, sessions: Optional[List[dict]] = None
-    ) -> List[List[List[float]]]:
+    ) -> np.ndarray:
         """
-        Her oturum için message_normalized embedding'lerini
-        sıralı dizi olarak toplar (padding öncesi).
-        Bilinmeyen metinler için sıfır vektör kullanılır.
+        Her oturum icin message_normalized embedding'lerini
+        siralanmis sekilde toplar (padding oncesi).
+        Sonucu dogrudan numpy array olarak dondurur — Python list overhead'i yok.
         """
-        # Önbellekte embedding yoksa BERT encode'u başlat
         if not self.message_embeddings:
             self.extract_message_embeddings_offline(sessions)
 
-        # Embedding boyutunu önbellekteki ilk vektörden çıkar; önbellek boşsa 768 varsay
-        emb_dim  = len(next(iter(self.message_embeddings.values()))) if self.message_embeddings else 768
-        # Bilinmeyen metinler veya eksik message_normalized için sıfır vektör kullanılır;
-        # model bu pozisyonları nötr (bilgisiz) olarak yorumlar
-        zero_vec = [0.0] * emb_dim
-        result: List[List[List[float]]] = []
+        emb_dim  = next(iter(self.message_embeddings.values())).shape[0] if self.message_embeddings else 768
+        zero_vec = np.zeros(emb_dim, dtype=np.float32)
 
         use_sessions = sessions if sessions is not None else self.raw_sessions
+        result: List[List[np.ndarray]] = []
         for session in use_sessions:
             seq = [
                 self.message_embeddings.get(
@@ -589,67 +633,37 @@ class DataPreprocessor:
     #
     # Tüm 3 veri türü (integer, multi-hot, embedding) aynı kuralı uygular.
 
-    def _pad_truncate_int(self, sequences: List[List[int]]) -> List[List[int]]:
-        """Tek boyutlu integer dizilerini MAX_SESSION_LENGTH'e getirir."""
-        fixed = []
-        for seq in sequences:
-            s = list(seq)
-            # Uzun dizi: truncation yönüne göre baş ya da kuyruk kesilir
-            if len(s) > self.MAX_SESSION_LENGTH:
-                s = (s[-self.MAX_SESSION_LENGTH:]   # pre: son 30 olayı koru
-                     if self.truncation == "pre"
-                     else s[:self.MAX_SESSION_LENGTH])  # post: ilk 30 olayı koru
-            # Kısa dizi: PAD token'ı (0) ile doldurulur
-            if len(s) < self.MAX_SESSION_LENGTH:
-                pad = [0] * (self.MAX_SESSION_LENGTH - len(s))
-                s   = pad + s if self.padding == "pre" else s + pad
-            fixed.append(s)
-        return fixed
+    # _pad_truncate_int ve _pad_truncate_multihot artik kullanilmiyor.
+    # encode_categorical_sequences dogrudan padded numpy array uretiyor.
+    # encode_and_pad_tags_to_file dogrudan memmap'e yaziyor.
 
-    def _pad_truncate_multihot(
-        self, sequences: List[List[List[int]]]
-    ) -> List[List[List[int]]]:
-        """Multi-hot tag matrislerini MAX_SESSION_LENGTH'e getirir."""
-        tag_size = len(self.tag_vocab)
-        # Padding satırı: tüm tag'ler 0 — olay yoksa etiket de yok
-        zero_vec = [0] * tag_size
-        fixed    = []
-        for seq in sequences:
-            s = list(seq)
-            # Uzun dizi: satır başı ya da kuyruğu truncation yönüne göre kesilir
-            if len(s) > self.MAX_SESSION_LENGTH:
-                s = (s[-self.MAX_SESSION_LENGTH:]
-                     if self.truncation == "pre"
-                     else s[:self.MAX_SESSION_LENGTH])
-            # Kısa dizi: sıfır satırlarla doldurulur; list() ile deep copy yapılır
-            if len(s) < self.MAX_SESSION_LENGTH:
-                pad = [list(zero_vec) for _ in range(self.MAX_SESSION_LENGTH - len(s))]
-                s   = pad + s if self.padding == "pre" else s + pad
-            fixed.append(s)
-        return fixed
+    def _pad_truncate_embeddings_to_file(self, sequences, out_path: Path) -> int:
+        """BERT embedding dizilerini MAX_SESSION_LENGTH'e getirir ve
+        dogrudan diske memory-mapped .npy olarak yazar.
+        Bellekte hicbir zaman tam array tutulmaz.
+        Dondurur: emb_dim (metadata icin)."""
+        T       = self.MAX_SESSION_LENGTH
+        emb_dim = sequences[0][0].shape[0] if sequences and len(sequences[0]) > 0 else 768
+        N       = len(sequences)
 
-    def _pad_truncate_embeddings(
-        self, sequences: List[List[List[float]]]
-    ) -> List[List[List[float]]]:
-        """BERT embedding dizilerini MAX_SESSION_LENGTH'e getirir."""
-        # Embedding boyutunu ilk vektörden çıkar; veri yoksa BERT varsayılanı 768
-        emb_dim  = len(sequences[0][0]) if sequences and sequences[0] else 768
-        # Padding vektörü: nötr anlam taşıyan sıfır vektörü (model maskeleme ile yok sayar)
-        zero_vec = [0.0] * emb_dim
-        fixed    = []
-        for seq in sequences:
-            s = list(seq)
-            # Uzun dizi: truncation yönüne göre vektör satırları kırpılır
-            if len(s) > self.MAX_SESSION_LENGTH:
-                s = (s[-self.MAX_SESSION_LENGTH:]
-                     if self.truncation == "pre"
-                     else s[:self.MAX_SESSION_LENGTH])
-            # Kısa dizi: sıfır vektör satırlarıyla doldurulur; list() ile deep copy yapılır
-            if len(s) < self.MAX_SESSION_LENGTH:
-                pad = [list(zero_vec) for _ in range(self.MAX_SESSION_LENGTH - len(s))]
-                s   = pad + s if self.padding == "pre" else s + pad
-            fixed.append(s)
-        return fixed
+        # np.lib.format.open_memmap: duzgun .npy header + disk-backed array
+        mmap = np.lib.format.open_memmap(
+            str(out_path), mode="w+", dtype=np.float32, shape=(N, T, emb_dim)
+        )
+        for i, seq in enumerate(sequences):
+            if not seq:
+                continue
+            vecs = np.stack(seq, axis=0)   # (len_seq, emb_dim)
+            n = len(vecs)
+            if n > T:
+                vecs = vecs[-T:] if self.truncation == "pre" else vecs[:T]
+                n = T
+            if self.padding == "pre":
+                mmap[i, T - n:] = vecs
+            else:
+                mmap[i, :n]     = vecs
+        del mmap  # flush & close
+        return emb_dim
 
     # -----------------------------------------------------------------------
     # ADIM 6 — Artifact kaydetme
@@ -679,15 +693,16 @@ class DataPreprocessor:
         (out / "processed").mkdir(parents=True, exist_ok=True)
 
         def _dump(path: Path, obj) -> None:
-            path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+            with path.open("w", encoding="utf-8") as _f:
+                json.dump(obj, _f, ensure_ascii=False)
 
         paths: Dict[str, Path] = {
             "all_vocabs":                   out / "vocab"     / "all_vocabs.json",
             "tag_vocab":                    out / "vocab"     / "tag_vocab.json",
             "session_features":             out / "processed" / "session_features.json",
-            "event_sequences":              out / "processed" / "event_sequences.json",
-            "tag_sequences":                out / "processed" / "tag_sequences.json",
-            "message_embedding_sequences":  out / "processed" / "message_embedding_sequences.json",
+            "event_sequences":              out / "processed" / "event_sequences.npz",
+            "tag_sequences":                out / "processed" / "tag_sequences.npy",
+            "message_embedding_sequences":  out / "processed" / "message_embedding_sequences.npy",
             "metadata":                     out / "processed" / "metadata.json",
         }
 
@@ -725,36 +740,28 @@ class DataPreprocessor:
         gc.collect()
         _LOGGER.info("session_features yazildi.")
 
-        # 3) Kategorik diziler → padding → yaz → boşalt
-        cat_sequences, session_ids, user_ids = self.encode_categorical_sequences(sessions_for_x)
-        padded_cat: Dict[str, List[List[int]]] = {}
-        for field in list(cat_sequences.keys()):
-            padded_cat[field] = self._pad_truncate_int(cat_sequences[field])
-            del cat_sequences[field]
-        del cat_sequences
-        _dump(paths["event_sequences"], padded_cat)
-        del padded_cat
+        # 3) Kategorik diziler → padded numpy array → .npz
+        # encode_categorical_sequences artik dogrudan (N, T) int32 array uretiyor
+        cat_arrays, _, _ = self.encode_categorical_sequences(sessions_for_x)
+        np.savez_compressed(str(paths["event_sequences"]), **cat_arrays)
+        del cat_arrays
         gc.collect()
         _LOGGER.info("event_sequences yazildi.")
 
-        # 4) Tag dizileri → multi-hot padding → yaz → boşalt (en büyük yapı)
-        raw_tag_seqs = self.encode_tag_sequences(sessions_for_x)
-        padded_tag_seqs = self._pad_truncate_multihot(raw_tag_seqs)
-        del raw_tag_seqs
-        gc.collect()
-        _dump(paths["tag_sequences"], padded_tag_seqs)
-        del padded_tag_seqs
+        # 4) Tag dizileri → dogrudan memmap'e (N, T, tag_vocab) uint8
+        # Hic Python list olusturulmaz; RAM'de sadece bir satir tutuluyor
+        tag_vocab_size = self.encode_and_pad_tags_to_file(
+            sessions_for_x, paths["tag_sequences"]
+        )
         gc.collect()
         _LOGGER.info("tag_sequences yazildi.")
 
-        # 5) BERT embedding sıraları → padding → yaz → boşalt
+        # 5) BERT embedding sıraları → padding → doğrudan diske memmap yaz
         raw_emb_seqs = self.build_message_embedding_sequences(sessions_for_x)
-        padded_emb_seqs = self._pad_truncate_embeddings(raw_emb_seqs)
+        emb_dim = self._pad_truncate_embeddings_to_file(
+            raw_emb_seqs, paths["message_embedding_sequences"]
+        )
         del raw_emb_seqs
-        gc.collect()
-        emb_dim = len(padded_emb_seqs[0][0]) if padded_emb_seqs and padded_emb_seqs[0] else 768
-        _dump(paths["message_embedding_sequences"], padded_emb_seqs)
-        del padded_emb_seqs
         # BERT modelini de bellekten at (sonraki adımlar gerekmiyor)
         self._bert_model = None
         self._tokenizer = None

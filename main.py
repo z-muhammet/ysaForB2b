@@ -3,10 +3,11 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
-import tensorflow as tf
+import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from dataPreprocessor import DataPreprocessor
-from hybridModelBuilder import HybridModelBuilder, SessionDataset
+from hybridModelBuilder import HybridModelBuilder, NumpyDataset, SessionDataset
 from modelTrainer import ModelTrainer
 
 
@@ -52,57 +53,66 @@ def _split_inputs(
 	rng.shuffle(idx)
 
 	train_end = int((1.0 - val_ratio - test_ratio) * len(idx))
-	val_end = int((1.0 - test_ratio) * len(idx))
+	val_end   = int((1.0 - test_ratio) * len(idx))
 
 	train_idx = idx[:train_end]
-	val_idx = idx[train_end:val_end]
-	test_idx = idx[val_end:]
-
-	train_inputs = {k: v[train_idx] for k, v in inputs.items()}
-	val_inputs = {k: v[val_idx] for k, v in inputs.items()}
-	test_inputs = {k: v[test_idx] for k, v in inputs.items()}
+	val_idx   = idx[train_end:val_end]
+	test_idx  = idx[val_end:]
 
 	return (
-		(train_inputs, labels[train_idx]),
-		(val_inputs, labels[val_idx]),
-		(test_inputs, labels[test_idx]),
+		({k: v[train_idx] for k, v in inputs.items()}, labels[train_idx]),
+		({k: v[val_idx]   for k, v in inputs.items()}, labels[val_idx]),
+		({k: v[test_idx]  for k, v in inputs.items()}, labels[test_idx]),
 	)
 
 
-def _to_tf_dataset(
+def _make_weighted_sampler(labels: np.ndarray, n_classes: int) -> WeightedRandomSampler:
+	"""Her sinifin secilme olasiligini esitler (beta=0.99 class-balanced)."""
+	counts = np.bincount(labels, minlength=n_classes).astype(float)
+	counts = np.where(counts == 0, 1, counts)
+	# Etkili sayi: (1 - beta^n) / (1 - beta)
+	beta = 0.99
+	eff  = (1.0 - beta ** counts) / (1.0 - beta)
+	class_w = 1.0 / eff
+	sample_w = torch.tensor([class_w[l] for l in labels], dtype=torch.float)
+	return WeightedRandomSampler(sample_w, num_samples=len(labels), replacement=True)
+
+
+def _to_dataloader(
 	inputs: Dict[str, np.ndarray],
 	labels: np.ndarray,
 	batch_size: int,
 	shuffle: bool,
-	seed: int = 42,
-) -> tf.data.Dataset:
-	ds = tf.data.Dataset.from_tensor_slices((inputs, labels))
-	if shuffle:
-		ds = ds.shuffle(buffer_size=len(labels), seed=seed)
-	return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+	sampler=None,
+) -> DataLoader:
+	pin = torch.cuda.is_available()
+	return DataLoader(
+		NumpyDataset(inputs, labels),
+		batch_size=batch_size,
+		shuffle=(shuffle and sampler is None),
+		sampler=sampler,
+		num_workers=0,
+		pin_memory=pin,
+		drop_last=shuffle,   # egitimde son eksik batch'i at
+	)
 
 
 def _log_label_stats(labels: np.ndarray, top_k: int = 10) -> None:
 	values, counts = np.unique(labels, return_counts=True)
 	order = np.argsort(counts)[::-1]
-
-	top_values = values[order][:top_k]
-	top_counts = counts[order][:top_k]
-	LOGGER.info("Top-%d label dagilimi: %s", top_k, dict(zip(top_values.tolist(), top_counts.tolist())))
+	LOGGER.info(
+		"Top-%d label dagilimi: %s", top_k,
+		dict(zip(values[order][:top_k].tolist(), counts[order][:top_k].tolist())),
+	)
 
 
 def _compute_class_weights(labels: np.ndarray, n_classes: int) -> Dict[int, float]:
 	counts = np.bincount(labels, minlength=n_classes)
-	valid_classes = np.where(counts > 0)[0]
-	if len(valid_classes) == 0:
-		raise ValueError("Sinif sayimi bos. Etiketler kontrol edilmeli.")
-
-	total = counts[valid_classes].sum()
-	weights: Dict[int, float] = {}
-	for cls in valid_classes:
-		weights[int(cls)] = float(total / (len(valid_classes) * counts[cls]))
-
-	return weights
+	valid  = np.where(counts > 0)[0]
+	if len(valid) == 0:
+		raise ValueError("Sinif sayimi bos.")
+	total   = counts[valid].sum()
+	return {int(c): float(total / (len(valid) * counts[c])) for c in valid}
 
 
 def main() -> None:
@@ -111,7 +121,7 @@ def main() -> None:
 		format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 	)
 
-	data_path = "n3_sessions_model_ready.json"
+	data_path  = "n3_sessions_model_ready.json"
 	output_dir = Path("output")
 	_ensure_artifacts(output_dir, data_path)
 
@@ -131,56 +141,69 @@ def main() -> None:
 
 	(
 		(train_inputs, train_labels),
-		(val_inputs, val_labels),
-		(test_inputs, test_labels),
+		(val_inputs,   val_labels),
+		(test_inputs,  test_labels),
 	) = _split_inputs(dataset.inputs, dataset.labels, val_ratio=0.2, test_ratio=0.1)
 
-	LOGGER.info("Train/Val/Test ornek sayilari: %d / %d / %d", len(train_labels), len(val_labels), len(test_labels))
+	LOGGER.info(
+		"Train/Val/Test ornek sayilari: %d / %d / %d",
+		len(train_labels), len(val_labels), len(test_labels),
+	)
 
 	event_vocab_size = int(dataset.metadata["categoricalVocabs"]["event_type"])
-	class_weights = _compute_class_weights(train_labels, event_vocab_size)
+	class_weights    = _compute_class_weights(train_labels, event_vocab_size)
 	LOGGER.info("Class weight sayisi: %d", len(class_weights))
 
-	train_ds = _to_tf_dataset(train_inputs, train_labels, batch_size=32, shuffle=True)
-	val_ds = _to_tf_dataset(val_inputs, val_labels, batch_size=32, shuffle=False)
-	test_ds = _to_tf_dataset(test_inputs, test_labels, batch_size=32, shuffle=False)
+	# WeightedRandomSampler: nadir siniflar daha sik secilir
+	sampler  = _make_weighted_sampler(train_labels, event_vocab_size)
+	train_dl = _to_dataloader(train_inputs, train_labels, batch_size=32, shuffle=False, sampler=sampler)
+	val_dl   = _to_dataloader(val_inputs,   val_labels,   batch_size=32, shuffle=False)
+	test_dl  = _to_dataloader(test_inputs,  test_labels,  batch_size=32, shuffle=False)
 
 	config = {
-		"task": "multiclass",
-		"n_classes": event_vocab_size,
-		"lstm_units": 128,
-		"learning_rate": 1e-3,
+		"task":          "multiclass",
+		"n_classes":     event_vocab_size,
+		"lstm_units":    128,
+		"dropout_rate":  0.3,
+		"learning_rate": 1e-2,
 	}
 
 	LOGGER.info("Model mimarisi kuruluyor...")
-	builder = HybridModelBuilder(config=config)
+	builder      = HybridModelBuilder(config=config)
 	hybrid_model = builder.build(dataset.metadata)
-	hybrid_model.summary()
+	total_params = sum(p.numel() for p in hybrid_model.parameters() if p.requires_grad)
+	LOGGER.info("Toplam egitilecek parametre: %d", total_params)
+
+	optimizer = torch.optim.AdamW(
+		hybrid_model.parameters(), lr=1e-2, weight_decay=5e-4
+	)
 
 	trainer = ModelTrainer(
 		hybrid_model=hybrid_model,
 		output_directory=str(output_dir / "models"),
-		tensorboard=True,
-		reduce_lr_on_plateau=True,
+		optimizer=optimizer,
+		patience=18,
+		label_smoothing=0.1,
+		gradient_accumulation_steps=4,
+		grad_clip=1.0,
+		rollback_acc_drop=0.03,
+		rollback_loss_rise=0.08,
+		max_rollbacks=10,
+		rollback_cooldown=5,
+		use_swa=True,
+		swa_start_ratio=0.7,
 	)
 
 	trainer.train(
-		training_dataset=train_ds,
-		validation_dataset=val_ds,
-		total_epochs=15,
+		training_dataset=train_dl,
+		validation_dataset=val_dl,
+		total_epochs=50,
 		class_weight=class_weights,
 	)
 
-	trainer.load_best_weights()
-	LOGGER.info("Egitim tamamlandi. En iyi agirliklar yüklendi.")
-
 	LOGGER.info("Test degerlendirmesi basliyor...")
-	results = trainer.evaluate(test_ds)
-	metric_names = hybrid_model.metrics_names
-	if isinstance(results, (list, tuple)):
-		LOGGER.info("Test metrikleri: %s", dict(zip(metric_names, results)))
-	else:
-		LOGGER.info("Test metrikleri: %s", results)
+	results = trainer.evaluate(test_dl)
+	LOGGER.info("Test metrikleri: loss=%.4f accuracy=%.4f", results["loss"], results["accuracy"])
 
 
 if __name__ == "__main__":
