@@ -60,6 +60,7 @@ class SessionDataset(Dataset):
         self._event_seq_npz   = np.load(str(self.processed_dir / "event_sequences.npz"))
         self._tag_seq_mmap    = np.load(str(self.processed_dir / "tag_sequences.npy"), mmap_mode="r")
         self._bert_mmap       = np.load(str(self.processed_dir / "message_embedding_sequences.npy"), mmap_mode="r")
+        self._user_ids        = np.load(str(self.processed_dir / "user_ids.npy"))
         self.session_features_raw = self._load_json(
             self.processed_dir / "session_features.json"
         )
@@ -117,6 +118,9 @@ class SessionDataset(Dataset):
             for row in self.session_features_raw
         ]
         inputs["in_session_features"] = np.asarray(features, dtype=np.float32)
+
+        # userId: her oturum icin tek bir integer
+        inputs["in_user_id"] = self._user_ids.astype(np.int64)
 
         return inputs
 
@@ -228,8 +232,13 @@ class HybridModel(nn.Module):
         )
         lstm_out_dim = lstm_units * (2 if bidirectional else 1)
 
-        # Statik dal
-        self.static_dense = nn.Linear(session_feat_dim, static_dim)
+        # userId embedding (oturum duzeyinde kimlik sinyali)
+        user_vocab_size  = int(metadata.get("userVocabSize", 1))
+        user_emb_dim     = min(64, (user_vocab_size // 2) + 1)
+        self.user_emb    = nn.Embedding(user_vocab_size, user_emb_dim, padding_idx=0)
+
+        # Statik dal: session_features + user embedding birlikte
+        self.static_dense = nn.Linear(session_feat_dim + user_emb_dim, static_dim)
         self.static_bn    = nn.BatchNorm1d(static_dim)
 
         # Fuzyon ve cikis
@@ -269,8 +278,12 @@ class HybridModel(nn.Module):
         lstm_out = torch.cat([h_n[0], h_n[1]], dim=-1) if self.lstm.bidirectional else h_n[0]
         lstm_out = self.dropout(lstm_out)  # (B, lstm_out_dim)
 
-        # Statik dal
-        static = torch.relu(self.static_dense(inputs["in_session_features"]))
+        # userId embedding: her kullanicinin kimlik temsili
+        user_emb = self.user_emb(inputs["in_user_id"])  # (B, user_emb_dim)
+
+        # Statik dal: session features + user embedding
+        static_in = torch.cat([inputs["in_session_features"], user_emb], dim=-1)
+        static = torch.relu(self.static_dense(static_in))
         static = self.static_bn(static)  # (B, static_dim)
 
         # Fuzyon

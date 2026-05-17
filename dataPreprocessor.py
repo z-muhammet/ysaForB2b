@@ -703,6 +703,7 @@ class DataPreprocessor:
             "event_sequences":              out / "processed" / "event_sequences.npz",
             "tag_sequences":                out / "processed" / "tag_sequences.npy",
             "message_embedding_sequences":  out / "processed" / "message_embedding_sequences.npy",
+            "user_ids":                     out / "processed" / "user_ids.npy",
             "metadata":                     out / "processed" / "metadata.json",
         }
 
@@ -740,13 +741,25 @@ class DataPreprocessor:
         gc.collect()
         _LOGGER.info("session_features yazildi.")
 
-        # 3) Kategorik diziler → padded numpy array → .npz
-        # encode_categorical_sequences artik dogrudan (N, T) int32 array uretiyor
-        cat_arrays, _, _ = self.encode_categorical_sequences(sessions_for_x)
+        # 3) Kategorik diziler + user_ids → padded numpy array → .npz / .npy
+        cat_arrays, _, user_ids_raw = self.encode_categorical_sequences(sessions_for_x)
         np.savez_compressed(str(paths["event_sequences"]), **cat_arrays)
         del cat_arrays
         gc.collect()
         _LOGGER.info("event_sequences yazildi.")
+
+        # userId vocab: PAD=0, geri kalanlar alfabetik sira
+        user_vocab: Dict[str, int] = {"PAD": 0}
+        for uid in sorted(set(user_ids_raw)):
+            if uid and uid not in user_vocab:
+                user_vocab[uid] = len(user_vocab)
+        encoded_user_ids = np.array(
+            [user_vocab.get(uid, 0) for uid in user_ids_raw], dtype=np.int32
+        )
+        np.save(str(paths["user_ids"]), encoded_user_ids)
+        del encoded_user_ids, user_ids_raw
+        gc.collect()
+        _LOGGER.info("user_ids yazildi. Benzersiz kullanici: %d", len(user_vocab))
 
         # 4) Tag dizileri → dogrudan memmap'e (N, T, tag_vocab) uint8
         # Hic Python list olusturulmaz; RAM'de sadece bir satir tutuluyor
@@ -793,6 +806,7 @@ class DataPreprocessor:
             "categoricalVocabs": {k: len(v) for k, v in self.vocabs.items()},
             "embeddingDimension": emb_dim,
             "sessionFeatureDim": session_feature_dim,
+            "userVocabSize":     len(user_vocab),
         })
 
         return {name: str(path) for name, path in paths.items()}

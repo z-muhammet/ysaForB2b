@@ -34,6 +34,21 @@ def _ensure_artifacts(output_dir: Path, data_path: str) -> Tuple[Path, Path]:
 	return metadata_path, labels_path
 
 
+def _filter_rare_classes(
+	inputs: Dict[str, np.ndarray],
+	labels: np.ndarray,
+	min_samples: int = 50,
+) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+	"""min_samples'tan az ornegi olan siniflari tamamen kaldir."""
+	counts = np.bincount(labels)
+	valid  = set(np.where(counts >= min_samples)[0])
+	removed = {int(c): int(counts[c]) for c in range(len(counts)) if c not in valid and counts[c] > 0}
+	if removed:
+		LOGGER.info("Nadir siniflar kaldirildi (<%d ornek): %s", min_samples, removed)
+	mask = np.array([l in valid for l in labels])
+	return {k: v[mask] for k, v in inputs.items()}, labels[mask]
+
+
 def _split_inputs(
 	inputs: Dict[str, np.ndarray],
 	labels: np.ndarray,
@@ -139,11 +154,17 @@ def main() -> None:
 	LOGGER.info("Time shift mode: %s", dataset.metadata.get("timeShiftMode"))
 	_log_label_stats(dataset.labels)
 
+	# Nadir siniflari (register: 21 ornek) tum split'lerden kaldir
+	inputs_filtered, labels_filtered = _filter_rare_classes(
+		dataset.inputs, dataset.labels, min_samples=50
+	)
+	LOGGER.info("Filtreleme sonrasi ornek sayisi: %d", len(labels_filtered))
+
 	(
 		(train_inputs, train_labels),
 		(val_inputs,   val_labels),
 		(test_inputs,  test_labels),
-	) = _split_inputs(dataset.inputs, dataset.labels, val_ratio=0.2, test_ratio=0.1)
+	) = _split_inputs(inputs_filtered, labels_filtered, val_ratio=0.2, test_ratio=0.1)
 
 	LOGGER.info(
 		"Train/Val/Test ornek sayilari: %d / %d / %d",
@@ -163,8 +184,13 @@ def main() -> None:
 	config = {
 		"task":          "multiclass",
 		"n_classes":     event_vocab_size,
-		"lstm_units":    128,
+		"lstm_units":    256,
+		"bert_proj_dim": 256,
+		"tag_proj_dim":  64,
+		"static_dim":    128,
+		"fusion_dim":    256,
 		"dropout_rate":  0.3,
+		"bidirectional": True,
 		"learning_rate": 1e-2,
 	}
 
