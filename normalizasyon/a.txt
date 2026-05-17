@@ -1,0 +1,11 @@
+# Seviye 1: Ham eventleri tagleyip anonimleştir
+python tag_and_anonymize.py
+
+# Seviye 2a: Session'lara grupla
+python build_sessions.py
+
+# Seviye 2b: Session'ları temizle
+python clean_sessions.py
+
+# Seviye 3: Final normalizasyon (tek-eventli ve pasif 2-eventlileri sil)
+python n3_filter_sessions.py
