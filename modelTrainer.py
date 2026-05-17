@@ -86,9 +86,19 @@ class ModelTrainer:
         self._swa_weights_path  = self.output_directory / "swa_model_weights.pt"
         self.history: Dict[str, List[float]] = {}
 
-        # AMP: sadece CUDA'da anlamlı
-        self._use_amp = self.device == "cuda"
-        self._scaler  = GradScaler("cuda", enabled=self._use_amp)
+        # AMP: bfloat16 tercih edilir (float16'nın NaN/overflow riskini taşımaz)
+        if self.device == "cuda":
+            self._use_amp   = True
+            self._amp_dtype = (torch.bfloat16
+                               if torch.cuda.is_bf16_supported()
+                               else torch.float16)
+        else:
+            self._use_amp   = False
+            self._amp_dtype = torch.float32
+        # GradScaler sadece float16'da gerekli; bfloat16'da disable edilir
+        _scaler_enabled   = self._use_amp and self._amp_dtype == torch.float16
+        self._scaler      = GradScaler("cuda", enabled=_scaler_enabled)
+        LOGGER.info("AMP dtype: %s | GradScaler: %s", self._amp_dtype, _scaler_enabled)
 
     # ------------------------------------------------------------------
     # Yardımcılar
@@ -120,20 +130,25 @@ class ModelTrainer:
         for step, batch in enumerate(dataloader):
             inputs, labels = self._move_batch(batch)
 
-            with torch.autocast(device_type=self.device if self.device != "cpu" else "cpu",
-                                 dtype=torch.float16 if self._use_amp else torch.float32,
-                                 enabled=self._use_amp):
-                outputs          = self.model(inputs)
-                per_sample_loss  = loss_fn(outputs, labels)
+            with torch.autocast(
+                device_type="cuda" if self.device == "cuda" else "cpu",
+                dtype=self._amp_dtype,
+                enabled=self._use_amp,
+            ):
+                outputs = self.model(inputs)
 
-                if class_weights is not None:
-                    w = torch.tensor(
-                        [class_weights.get(int(l), 1.0) for l in labels],
-                        dtype=torch.float32, device=self.device,
-                    )
-                    loss = (per_sample_loss * w).mean() / accum_steps
-                else:
-                    loss = per_sample_loss.mean() / accum_steps
+            # Loss her zaman float32'de hesaplanır — float16 NaN/overflow riskini sıfırlar
+            outputs_f32 = outputs.float()
+            per_sample_loss = loss_fn(outputs_f32, labels)
+
+            if class_weights is not None:
+                w = torch.tensor(
+                    [class_weights.get(int(l), 1.0) for l in labels],
+                    dtype=torch.float32, device=self.device,
+                )
+                loss = (per_sample_loss * w).mean() / accum_steps
+            else:
+                loss = per_sample_loss.mean() / accum_steps
 
             if training:
                 self._scaler.scale(loss).backward()
@@ -141,23 +156,23 @@ class ModelTrainer:
                 if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
                     self._scaler.unscale_(self.optimizer)
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+
+                    # scaler.step optimizer'ı NaN grad yoksa çağırır; bunu izle
+                    scale_before = self._scaler.get_scale()
                     self._scaler.step(self.optimizer)
                     self._scaler.update()
+                    optimizer_stepped = (self._scaler.get_scale() == scale_before)
+
                     self.optimizer.zero_grad(set_to_none=True)
 
-                    # OneCycleLR adımı batch bazında atılır
-                    if scheduler is not None and isinstance(
-                        scheduler, torch.optim.lr_scheduler.OneCycleLR
-                    ):
+                    # OneCycleLR sadece optimizer gerçekten adım attıysa ilerler
+                    if (optimizer_stepped and scheduler is not None
+                            and isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR)):
                         scheduler.step()
 
             with torch.no_grad():
-                real_loss = (per_sample_loss.mean() if class_weights is None
-                             else (per_sample_loss * torch.tensor(
-                                 [class_weights.get(int(l), 1.0) for l in labels],
-                                 dtype=torch.float32, device=self.device)).mean())
-                total_loss    += real_loss.item() * labels.size(0)
-                preds          = outputs.argmax(dim=-1) if outputs.dim() > 1 else (outputs > 0.5).long()
+                total_loss    += per_sample_loss.mean().item() * labels.size(0)
+                preds          = outputs_f32.argmax(dim=-1) if outputs_f32.dim() > 1 else (outputs_f32 > 0.5).long()
                 total_correct += (preds == labels).sum().item()
                 total_samples += labels.size(0)
 
