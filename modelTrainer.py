@@ -6,11 +6,33 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler
-from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+from torch.optim.swa_utils import AveragedModel, SWALR
 from torch.utils.data import DataLoader
 
 LOGGER = logging.getLogger("ysaForB2b")
+
+
+class FocalLoss(nn.Module):
+    """Multiclass Focal Loss — sinif dengesizligine karsi."""
+
+    def __init__(self, gamma: float = 2.0, reduction: str = "none") -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        log_p = F.log_softmax(logits, dim=-1)
+        p     = log_p.exp()
+        target_log_p = log_p.gather(1, targets.unsqueeze(1)).squeeze(1)
+        target_p     = p.gather(1, targets.unsqueeze(1)).squeeze(1)
+        loss = -(1.0 - target_p) ** self.gamma * target_log_p
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 
 class ModelTrainer:
@@ -110,6 +132,33 @@ class ModelTrainer:
         labels = labels.to(self.device, non_blocking=True)
         return inputs, labels
 
+    def _update_swa_bn(self, loader, swa_model):
+        momenta = {}
+        for module in swa_model.modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                module.running_mean.zero_()
+                module.running_var.fill_(1)
+                module.num_batches_tracked.zero_()
+                momenta[module] = module.momentum
+
+        if not momenta:
+            return
+
+        was_training = swa_model.training
+        swa_model.train()
+        for module in momenta.keys():
+            module.momentum = None
+
+        with torch.no_grad():
+            for batch in loader:
+                inputs, _ = self._move_batch(batch)
+                with torch.autocast(device_type="cuda", dtype=self._amp_dtype, enabled=self._use_amp):
+                    swa_model(inputs)
+
+        for bn_module in momenta.keys():
+            bn_module.momentum = momenta[bn_module]
+        swa_model.train(was_training)
+
     def _run_epoch(
         self,
         dataloader: DataLoader,
@@ -198,9 +247,7 @@ class ModelTrainer:
             if task == "binary":
                 loss_fn = nn.BCELoss(reduction="none")
             elif task == "multiclass":
-                loss_fn = nn.CrossEntropyLoss(
-                    reduction="none", label_smoothing=self.label_smoothing
-                )
+                loss_fn = FocalLoss(gamma=2.0, reduction="none")
             else:
                 loss_fn = nn.MSELoss(reduction="none")
 
@@ -220,9 +267,10 @@ class ModelTrainer:
                     min_lr=self.min_lr,
                 )
             else:
+                base_lr = max(pg["lr"] for pg in self.optimizer.param_groups)
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(
                     self.optimizer,
-                    max_lr=1e-2,
+                    max_lr=base_lr,
                     steps_per_epoch=steps_per_epoch,
                     epochs=total_epochs,
                     pct_start=0.3,
@@ -246,6 +294,8 @@ class ModelTrainer:
         rollback_cooldown_left = 0
         prev_val_loss = float("inf")
         prev_val_acc  = 0.0
+        swa_applied   = False
+        best_scheduler_state = None
 
         self.history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
@@ -295,6 +345,7 @@ class ModelTrainer:
             # SWA güncelle
             if swa_model is not None and epoch > swa_start:
                 swa_model.update_parameters(self.model)
+                swa_applied = True
                 if swa_scheduler is not None:
                     swa_scheduler.step()
 
@@ -305,8 +356,11 @@ class ModelTrainer:
                 loss_rise  = (val_loss - prev_val_loss) / (prev_val_loss + 1e-9)
                 if acc_drop >= self.rollback_acc_drop or loss_rise >= self.rollback_loss_rise:
                     self.load_best_weights()
+                    if best_scheduler_state is not None:
+                        scheduler.load_state_dict(best_scheduler_state)
                     rollback_count         += 1
                     rollback_cooldown_left  = self.rollback_cooldown
+                    no_improve             = 0
                     LOGGER.warning(
                         "ROLLBACK #%d: acc_drop=%.3f loss_rise=%.3f — en iyi agirliklar geri yuklendi.",
                         rollback_count, acc_drop, loss_rise,
@@ -325,6 +379,7 @@ class ModelTrainer:
                 best_epoch  = epoch
                 no_improve  = 0
                 torch.save(self.model.state_dict(), self._best_weights_path)
+                best_scheduler_state = scheduler.state_dict()
                 LOGGER.info(
                     "En iyi model kaydedildi (epoch %d, %s=%.4f)",
                     epoch, self.monitor, best_metric,
@@ -344,9 +399,9 @@ class ModelTrainer:
             gc.collect()
 
         # --- SWA batch norm güncelle ve kaydet ---
-        if swa_model is not None:
+        if swa_model is not None and swa_applied:
             LOGGER.info("SWA BatchNorm guncelleniyor...")
-            update_bn(training_dataset, swa_model, device=self.device)
+            self._update_swa_bn(training_dataset, swa_model)
             torch.save(swa_model.state_dict(), self._swa_weights_path)
             LOGGER.info("SWA agirliklari kaydedildi: %s", self._swa_weights_path)
 

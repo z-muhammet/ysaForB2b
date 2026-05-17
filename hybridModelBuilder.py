@@ -105,12 +105,7 @@ class SessionDataset(Dataset):
         # Tag dizileri: memmap (disk-backed), float32'ye cast ederken kopyalanir
         inputs["in_tags"] = self._tag_seq_mmap.astype(np.float32)
 
-        # BERT embedding'leri: memmap, zaten float32
-        inputs["in_bert"] = (
-            self._bert_mmap.astype(np.float32)
-            if self._bert_mmap.dtype != np.float32
-            else np.array(self._bert_mmap)  # memmap'i RAM'e al (DataLoader icin)
-        )
+        inputs["in_bert"] = self._bert_mmap
 
         # Oturum ozellikleri: kucuk, JSON'dan
         features = [
@@ -155,24 +150,21 @@ class SessionDataset(Dataset):
 
 
 class NumpyDataset(Dataset):
-    """
-    Split edilmis numpy dizilerini PyTorch Dataset'e sarar.
-    _split_inputs() ciktisiyla kullanilir.
-    """
-
-    def __init__(self, inputs: Dict[str, np.ndarray], labels: np.ndarray) -> None:
-        self.inputs = inputs
-        self.labels = labels
+    def __init__(self, inputs: Dict[str, np.ndarray], labels: np.ndarray, indices: np.ndarray = None) -> None:
+        self.inputs  = inputs
+        self.labels  = labels
+        self.indices = indices if indices is not None else np.arange(len(labels))
 
     def __len__(self) -> int:
-        return self.labels.shape[0]
+        return len(self.indices)
 
     def __getitem__(self, idx: int):
+        real_idx = int(self.indices[idx])
         sample = {
-            name: torch.from_numpy(arr[idx].copy())
+            name: torch.from_numpy(np.asarray(arr[real_idx]).copy())
             for name, arr in self.inputs.items()
         }
-        return sample, torch.tensor(int(self.labels[idx]), dtype=torch.long)
+        return sample, torch.tensor(int(self.labels[real_idx]), dtype=torch.long)
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +196,7 @@ class HybridModel(nn.Module):
         static_dim    = int(config.get("static_dim",     64))
         fusion_dim    = int(config.get("fusion_dim",    128))
         dropout_rate  = float(config.get("dropout_rate", 0.3))
-        bidirectional = bool(config.get("bidirectional", False))
+        bidirectional = bool(config.get("bidirectional", True))
         self.task     = config.get("task", "multiclass")
         n_classes     = int(config.get("n_classes", 2))
 
@@ -231,6 +223,11 @@ class HybridModel(nn.Module):
             bidirectional=bidirectional,
         )
         lstm_out_dim = lstm_units * (2 if bidirectional else 1)
+
+        # Self-attention: LSTM cikisini temporal olarak agirliklandirir
+        num_heads = 8 if lstm_out_dim % 8 == 0 else (4 if lstm_out_dim % 4 == 0 else 1)
+        self.attn      = nn.MultiheadAttention(lstm_out_dim, num_heads=num_heads, batch_first=True, dropout=dropout_rate)
+        self.attn_norm = nn.LayerNorm(lstm_out_dim)
 
         # userId embedding (oturum duzeyinde kimlik sinyali)
         user_vocab_size  = int(metadata.get("userVocabSize", 1))
@@ -272,10 +269,18 @@ class HybridModel(nn.Module):
         # PackedSequence: padded timestep'ler LSTM'e girmiyor
         seq_lens = (inputs[f"in_{self.mask_field}"] != 0).sum(dim=1).cpu().clamp(min=1)
         packed   = nn.utils.rnn.pack_padded_sequence(seq, seq_lens, batch_first=True, enforce_sorted=False)
-        _, (h_n, _) = self.lstm(packed)
+        lstm_seq, _ = self.lstm(packed)
+        lstm_seq, _ = nn.utils.rnn.pad_packed_sequence(lstm_seq, batch_first=True)  # (B, T, lstm_out_dim)
 
-        # Bidirectional ise iki yonu birlestir
-        lstm_out = torch.cat([h_n[0], h_n[1]], dim=-1) if self.lstm.bidirectional else h_n[0]
+        # Self-attention: her timestep'in diger timestep'lerle iliskisini ogren
+        # key_padding_mask: True olan pozisyonlar ignore edilir (PAD timestep'leri)
+        pad_mask = (inputs[f"in_{self.mask_field}"][:, :lstm_seq.size(1)] == 0)  # (B, T)
+        attn_out, _ = self.attn(lstm_seq, lstm_seq, lstm_seq, key_padding_mask=pad_mask)
+        attn_out = self.attn_norm(lstm_seq + attn_out)  # residual + LayerNorm
+
+        # Masked mean pooling: PAD olmayan timestep'lerin ortalamasini al
+        seq_mask = (~pad_mask).float().unsqueeze(-1)  # (B, T, 1)
+        lstm_out = (attn_out * seq_mask).sum(dim=1) / seq_mask.sum(dim=1).clamp(min=1)
         lstm_out = self.dropout(lstm_out)  # (B, lstm_out_dim)
 
         # userId embedding: her kullanicinin kimlik temsili

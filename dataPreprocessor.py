@@ -223,9 +223,8 @@ class DataPreprocessor:
             features.append({
                 # --- Zaman özellikleri ---
                 # hour_of_day ham tutulur; model gece/gündüz örüntüsünü öğrenir
-                "hour_of_day":         st.get("hour_of_day", 0),
-                # month mevsimsel tedarik döngülerini (Q4 sipariş patlaması vb.) yansıtır
-                "month":               st.get("month", 1),
+                "hour_of_day":         st.get("hour_of_day", 0) / 24.0,
+                "month":               (st.get("month", 1) - 1) / 11.0,
                 # Haftanın günü ve gün dilimi ordinal: bilinmeyen değer → 0 (PAD semantiği)
                 "day_of_week_id":      _DAY_OF_WEEK.get(st.get("day_of_week", ""), 0),
                 "time_of_day_id":      _TIME_OF_DAY.get(st.get("time_of_day", ""), 0),
@@ -585,7 +584,7 @@ class DataPreprocessor:
         _LOGGER.info("BERT embedding cache diske yaziliyor: %s", _cache_path)
         np.savez_compressed(
             str(_cache_path),
-            texts=np.array(unique_texts, dtype=object),
+            texts=np.array(unique_texts, dtype=str),
             vectors=vectors_arr,
         )
 

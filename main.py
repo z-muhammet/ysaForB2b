@@ -35,50 +35,31 @@ def _ensure_artifacts(output_dir: Path, data_path: str) -> Tuple[Path, Path]:
 
 
 def _filter_rare_classes(
-	inputs: Dict[str, np.ndarray],
 	labels: np.ndarray,
 	min_samples: int = 50,
-) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
-	"""min_samples'tan az ornegi olan siniflari tamamen kaldir."""
+) -> np.ndarray:
 	counts = np.bincount(labels)
 	valid  = set(np.where(counts >= min_samples)[0])
 	removed = {int(c): int(counts[c]) for c in range(len(counts)) if c not in valid and counts[c] > 0}
 	if removed:
 		LOGGER.info("Nadir siniflar kaldirildi (<%d ornek): %s", min_samples, removed)
-	mask = np.array([l in valid for l in labels])
-	return {k: v[mask] for k, v in inputs.items()}, labels[mask]
+	return np.where(np.isin(labels, list(valid)))[0]
 
 
-def _split_inputs(
-	inputs: Dict[str, np.ndarray],
-	labels: np.ndarray,
+def _split_indices(
+	n: int,
 	val_ratio: float = 0.2,
 	test_ratio: float = 0.1,
 	seed: int = 42,
-) -> Tuple[
-	Tuple[Dict[str, np.ndarray], np.ndarray],
-	Tuple[Dict[str, np.ndarray], np.ndarray],
-	Tuple[Dict[str, np.ndarray], np.ndarray],
-]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 	if val_ratio + test_ratio >= 1.0:
 		raise ValueError("val_ratio + test_ratio 1.0'dan kucuk olmali.")
-
 	rng = np.random.default_rng(seed)
-	idx = np.arange(labels.shape[0])
+	idx = np.arange(n)
 	rng.shuffle(idx)
-
-	train_end = int((1.0 - val_ratio - test_ratio) * len(idx))
-	val_end   = int((1.0 - test_ratio) * len(idx))
-
-	train_idx = idx[:train_end]
-	val_idx   = idx[train_end:val_end]
-	test_idx  = idx[val_end:]
-
-	return (
-		({k: v[train_idx] for k, v in inputs.items()}, labels[train_idx]),
-		({k: v[val_idx]   for k, v in inputs.items()}, labels[val_idx]),
-		({k: v[test_idx]  for k, v in inputs.items()}, labels[test_idx]),
-	)
+	train_end = int((1.0 - val_ratio - test_ratio) * n)
+	val_end   = int((1.0 - test_ratio) * n)
+	return idx[:train_end], idx[train_end:val_end], idx[val_end:]
 
 
 def _make_weighted_sampler(labels: np.ndarray, n_classes: int) -> WeightedRandomSampler:
@@ -96,19 +77,20 @@ def _make_weighted_sampler(labels: np.ndarray, n_classes: int) -> WeightedRandom
 def _to_dataloader(
 	inputs: Dict[str, np.ndarray],
 	labels: np.ndarray,
+	indices: np.ndarray,
 	batch_size: int,
 	shuffle: bool,
 	sampler=None,
 ) -> DataLoader:
 	pin = torch.cuda.is_available()
 	return DataLoader(
-		NumpyDataset(inputs, labels),
+		NumpyDataset(inputs, labels, indices),
 		batch_size=batch_size,
 		shuffle=(shuffle and sampler is None),
 		sampler=sampler,
 		num_workers=0,
 		pin_memory=pin,
-		drop_last=shuffle,   # egitimde son eksik batch'i at
+		drop_last=shuffle,
 	)
 
 
@@ -154,17 +136,18 @@ def main() -> None:
 	LOGGER.info("Time shift mode: %s", dataset.metadata.get("timeShiftMode"))
 	_log_label_stats(dataset.labels)
 
-	# Nadir siniflari (register: 21 ornek) tum split'lerden kaldir
-	inputs_filtered, labels_filtered = _filter_rare_classes(
-		dataset.inputs, dataset.labels, min_samples=50
-	)
-	LOGGER.info("Filtreleme sonrasi ornek sayisi: %d", len(labels_filtered))
+	filter_idx = _filter_rare_classes(dataset.labels, min_samples=50)
+	LOGGER.info("Filtreleme sonrasi ornek sayisi: %d", len(filter_idx))
 
-	(
-		(train_inputs, train_labels),
-		(val_inputs,   val_labels),
-		(test_inputs,  test_labels),
-	) = _split_inputs(inputs_filtered, labels_filtered, val_ratio=0.2, test_ratio=0.1)
+	train_rel, val_rel, test_rel = _split_indices(len(filter_idx), val_ratio=0.2, test_ratio=0.1)
+
+	train_idx = filter_idx[train_rel]
+	val_idx   = filter_idx[val_rel]
+	test_idx  = filter_idx[test_rel]
+
+	train_labels = dataset.labels[train_idx]
+	val_labels   = dataset.labels[val_idx]
+	test_labels  = dataset.labels[test_idx]
 
 	LOGGER.info(
 		"Train/Val/Test ornek sayilari: %d / %d / %d",
@@ -175,20 +158,19 @@ def main() -> None:
 	class_weights    = _compute_class_weights(train_labels, event_vocab_size)
 	LOGGER.info("Class weight sayisi: %d", len(class_weights))
 
-	# WeightedRandomSampler: nadir siniflar daha sik secilir
 	sampler  = _make_weighted_sampler(train_labels, event_vocab_size)
-	train_dl = _to_dataloader(train_inputs, train_labels, batch_size=32, shuffle=False, sampler=sampler)
-	val_dl   = _to_dataloader(val_inputs,   val_labels,   batch_size=32, shuffle=False)
-	test_dl  = _to_dataloader(test_inputs,  test_labels,  batch_size=32, shuffle=False)
+	train_dl = _to_dataloader(dataset.inputs, dataset.labels, train_idx, batch_size=32, shuffle=False, sampler=sampler)
+	val_dl   = _to_dataloader(dataset.inputs, dataset.labels, val_idx,   batch_size=32, shuffle=False)
+	test_dl  = _to_dataloader(dataset.inputs, dataset.labels, test_idx,  batch_size=32, shuffle=False)
 
 	config = {
 		"task":          "multiclass",
 		"n_classes":     event_vocab_size,
-		"lstm_units":    256,
-		"bert_proj_dim": 256,
+		"lstm_units":    512,
+		"bert_proj_dim": 384,
 		"tag_proj_dim":  64,
 		"static_dim":    128,
-		"fusion_dim":    256,
+		"fusion_dim":    512,
 		"dropout_rate":  0.3,
 		"bidirectional": True,
 		"learning_rate": 1e-2,
@@ -200,16 +182,22 @@ def main() -> None:
 	total_params = sum(p.numel() for p in hybrid_model.parameters() if p.requires_grad)
 	LOGGER.info("Toplam egitilecek parametre: %d", total_params)
 
+	decay_params    = [p for _, p in hybrid_model.named_parameters() if p.requires_grad and p.dim() >= 2]
+	no_decay_params = [p for _, p in hybrid_model.named_parameters() if p.requires_grad and p.dim() < 2]
 	optimizer = torch.optim.AdamW(
-		hybrid_model.parameters(), lr=1e-2, weight_decay=5e-4
+		[
+			{"params": decay_params,    "weight_decay": 1e-2},
+			{"params": no_decay_params, "weight_decay": 0.0},
+		],
+		lr=3e-4,
 	)
 
 	trainer = ModelTrainer(
 		hybrid_model=hybrid_model,
 		output_directory=str(output_dir / "models"),
 		optimizer=optimizer,
-		patience=18,
-		label_smoothing=0.1,
+		patience=30,
+		label_smoothing=0.05,
 		gradient_accumulation_steps=4,
 		grad_clip=1.0,
 		rollback_acc_drop=0.03,
@@ -217,13 +205,13 @@ def main() -> None:
 		max_rollbacks=10,
 		rollback_cooldown=5,
 		use_swa=True,
-		swa_start_ratio=0.7,
+		swa_start_ratio=0.75,
 	)
 
 	trainer.train(
 		training_dataset=train_dl,
 		validation_dataset=val_dl,
-		total_epochs=50,
+		total_epochs=100,
 		class_weight=class_weights,
 	)
 
